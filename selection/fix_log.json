@@ -1,0 +1,42 @@
+{
+  "fix_ts": "2026-03-11T10:23:00Z",
+  "changes": [
+    {
+      "feature": "log_return_1",
+      "issue": "missing outer .shift(1) — leaky, correlated with label by construction",
+      "before": "log(close / close.shift(1))",
+      "after": "log(close / close.shift(1)).shift(1)"
+    },
+    {
+      "feature": "log_return_3",
+      "issue": "same as log_return_1",
+      "before": "log(close / close.shift(3))",
+      "after": "log(close / close.shift(3)).shift(1)"
+    },
+    {
+      "feature": "log_return_6",
+      "issue": "same as log_return_1",
+      "before": "log(close / close.shift(6))",
+      "after": "log(close / close.shift(6)).shift(1)"
+    },
+    {
+      "feature": "log_return_12",
+      "issue": "same as log_return_1",
+      "before": "log(close / close.shift(12))",
+      "after": "log(close / close.shift(12)).shift(1)"
+    },
+    {
+      "feature": "log_return_24",
+      "issue": "same as log_return_1",
+      "before": "log(close / close.shift(24))",
+      "after": "log(close / close.shift(24)).shift(1)"
+    }
+  ],
+  "derived_features_updated": [
+    "return_skewness_30 — now uses canonical log_return_1 via features_df parameter",
+    "return_percentile_100 — now uses canonical log_return_1 via features_df parameter",
+    "btc_sol_corr_50 — now uses canonical log_return_1 via features_df parameter"
+  ],
+  "boruta_impact": "log_return_1 and log_return_3 were in the previously confirmed 6-feature set. Their importance scores are likely inflated by leakage. The next Boruta run is expected to produce materially different results.",
+  "realized_vol_note": "realized_vol_{12,50,200} also use log_return_1 as input. The shift propagates correctly since realized_vol is a rolling std of log_return_1 — the std of shifted returns equals the std of the original returns shifted by 1."
+}

@@ -161,7 +161,7 @@ def build_price_volume_features(df: pd.DataFrame) -> pd.DataFrame:
     # Log returns at lags: 1, 3, 6, 12, 24 bars
     close = df['close']
     for lag in [1, 3, 6, 12, 24]:
-        features[f'log_return_{lag}'] = np.log(close / close.shift(lag))
+        features[f'log_return_{lag}'] = np.log(close / close.shift(lag)).shift(1)
 
     # Rolling realized volatility: 12, 50, 200 bars
     log_ret_1 = features['log_return_1']
@@ -505,20 +505,17 @@ def build_signed_volume_features(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Group 6: Rolling Return Statistics ───────────────────────────────────────
 
-def build_return_stat_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_return_stat_features(df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
     """
     G6 — Rolling Return Statistics.
 
-    Uses ret_1 = log(close/close.shift(1)).shift(1) — the LAGGED 1-bar return.
-    Existing log_return_1 uses close[t] and is NOT outer-shifted.
-    We compute our own lagged version to avoid leakage.
+    Uses canonical log_return_1 from features_df, which is already properly
+    shifted: log(close/close.shift(1)).shift(1).
     """
     features = pd.DataFrame(index=df.index)
 
-    # ret_1: 1-bar log return, lagged one bar to avoid leakage
-    # log_return_1 = log(close[t] / close[t-1]) uses close[t] → leaky
-    # ret_1 = log(close[t-1] / close[t-2]) = log_return_1.shift(1)
-    ret_1 = np.log(df['close'] / df['close'].shift(1)).shift(1)
+    # Use canonical log_return_1 — already lagged by .shift(1)
+    ret_1 = features_df['log_return_1']
 
     features['return_skewness_30'] = ret_1.rolling(30).skew()
     features['return_percentile_100'] = ret_1.rolling(100).rank(pct=True)
@@ -548,12 +545,13 @@ def build_ma_distance_features(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Group 8: Cross-Asset SOL ─────────────────────────────────────────────────
 
-def build_sol_cross_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_sol_cross_features(df: pd.DataFrame, features_df: pd.DataFrame) -> pd.DataFrame:
     """
     G8 — Cross-Asset SOL features (BTC model only).
 
     Requires 'sol_close' column in df, added by fetcher.merge_supplementary_data().
     When SOL data is unavailable, returns zeros.
+    Uses canonical log_return_1 from features_df for BTC-SOL correlation.
     """
     features = pd.DataFrame(index=df.index)
 
@@ -567,7 +565,7 @@ def build_sol_cross_features(df: pd.DataFrame) -> pd.DataFrame:
         features['sol_ret_lag6'] = np.log(sol_close / sol_close.shift(6)).shift(1)
 
         # BTC-SOL rolling correlation — both inputs already pre-lagged
-        ret_1 = np.log(df['close'] / df['close'].shift(1)).shift(1)
+        ret_1 = features_df['log_return_1']  # canonical, already shifted
         features['btc_sol_corr_50'] = ret_1.rolling(50).corr(sol_ret_lag1)
     else:
         features['sol_ret_lag1'] = 0.0
@@ -598,9 +596,12 @@ def build_features(
         DataFrame with all features. Same length as input, but early rows will
         have NaNs due to lookback windows.
     """
+    # Build original feature groups first (§5 of spec)
+    price_vol_features = build_price_volume_features(df)
+
     features = pd.concat([
         # Original feature groups (§5 of spec)
-        build_price_volume_features(df),
+        price_vol_features,
         build_microstructure_features(df),
         build_volatility_regime_features(df),
         build_technical_features(df),
@@ -611,9 +612,9 @@ def build_features(
         build_temporal_features(df),
         build_price_action_features(df),
         build_signed_volume_features(df),
-        build_return_stat_features(df),
+        build_return_stat_features(df, price_vol_features),  # uses log_return_1
         build_ma_distance_features(df),
-        build_sol_cross_features(df),
+        build_sol_cross_features(df, price_vol_features),    # uses log_return_1
     ], axis=1)
 
     # Forward-fill any residual NaNs after warmup period, then backfill the rest.

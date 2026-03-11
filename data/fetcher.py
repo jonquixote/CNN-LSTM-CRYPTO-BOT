@@ -268,6 +268,11 @@ def fetch_open_interest(
     Available at 5m resolution. Binance limits to ~500 records per request
     and max 30 days history for this endpoint.
 
+    NOTE: Binance openInterestHist endpoint maximum history is 30 days at 5m resolution.
+    If re-running features from scratch on data older than 30 days ago, OI will have gaps
+    and oi_delta / oi_delta_zscore / signed_oi_delta will be NaN for those bars.
+    The NaN handling in features.py fills these with 0 — this is a documented assumption.
+
     Returns DataFrame with columns: timestamp, open_interest
     """
     import requests

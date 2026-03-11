@@ -299,43 +299,41 @@ def run_boruta_shap():
     with open("/tmp/selection/boruta_shap_results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    # ── Save to Volume as primary backup (survives rsync failures) ───
+    # ── Save to Volume as primary backup ───────────────────────────────────
     print("\n--- Saving results to Volume ---")
     import shutil
     shutil.copy("/tmp/staging_artifacts/feature_list.json", "/data/feature_list.json")
     shutil.copy("/tmp/selection/boruta_shap_results.json", "/data/boruta_shap_results.json")
-    data_volume.commit()  # Persist to Volume
+    try:
+        data_volume.commit()
+    except Exception as e:
+        raise RuntimeError(f"Volume commit failed — artifacts not persisted: {e}")
     print("  ✓ feature_list.json → Volume")
     print("  ✓ boruta_shap_results.json → Volume")
 
-    # ── Rsync artifacts to VPS (best-effort, non-fatal) ──────────────
+    # ── Rsync artifacts to VPS (fatal on failure) ────────────────────
     print("\n--- Syncing artifacts to VPS ---")
-    rsync_ok = True
+    key_path = get_ssh_key_path()
     try:
-        key_path = get_ssh_key_path()
-        try:
-            # feature_list.json → artifacts dir
-            rsync_with_retry([
-                "rsync", "-az", "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
-                "/tmp/staging_artifacts/feature_list.json",
-                config.infrastructure.artifact_remote_path.rstrip("/") + "/"
-            ])
-            print("  ✓ feature_list.json → VPS artifacts")
+        # feature_list.json → artifacts dir
+        rsync_with_retry([
+            "rsync", "-az", "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
+            "/tmp/staging_artifacts/feature_list.json",
+            config.infrastructure.artifact_remote_path.rstrip("/") + "/"
+        ])
+        print("  ✓ feature_list.json → VPS artifacts")
 
-            # boruta_shap_results.json → jobs/selection/
-            remote_selection = config.infrastructure.jobs_remote_path.rstrip("/") + "/selection/"
-            rsync_with_retry([
-                "rsync", "-az", "--rsync-path", "mkdir -p /root/cnn_lstm_v1/jobs/selection && rsync",
-                "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
-                "/tmp/selection/boruta_shap_results.json",
-                remote_selection
-            ])
-            print("  ✓ boruta_shap_results.json → VPS jobs/selection/")
-        finally:
-            os.unlink(key_path)
-    except Exception as e:
-        rsync_ok = False
-        print(f"  ✗ Rsync to VPS failed (non-fatal, results saved to Volume): {e}")
+        # boruta_shap_results.json → jobs/selection/
+        remote_selection = config.infrastructure.jobs_remote_path.rstrip("/") + "/selection/"
+        rsync_with_retry([
+            "rsync", "-az", "--rsync-path", "mkdir -p /root/cnn_lstm_v1/jobs/selection && rsync",
+            "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
+            "/tmp/selection/boruta_shap_results.json",
+            remote_selection
+        ])
+        print("  ✓ boruta_shap_results.json → VPS jobs/selection/")
+    finally:
+        os.unlink(key_path)
 
     # ── Timing log ───────────────────────────────────────────────────
     log_gpu_timing("boruta_shap", gpu_start_ts, 1800, 300,
@@ -344,8 +342,6 @@ def run_boruta_shap():
     print("\n" + "=" * 60)
     print(f"BORUTA-SHAP COMPLETE — {len(accepted)} features confirmed")
     print(f"Cost: ${(time.time() - gpu_start_ts) / 3600 * 6.25:.4f}")
-    if not rsync_ok:
-        print("NOTE: Results saved to Volume only — rsync to VPS failed")
     print("=" * 60)
 
     return results
@@ -640,42 +636,40 @@ def run_optuna_search():
     shutil.copy("/tmp/tuning/optuna_results.json", "/data/optuna_results.json")
     shutil.copy("/tmp/tuning/optuna_study.db", "/data/optuna_study.db")
     shutil.copy("/tmp/config.yaml", "/data/config.yaml")
-    data_volume.commit()
+    try:
+        data_volume.commit()
+    except Exception as e:
+        raise RuntimeError(f"Volume commit failed — artifacts not persisted: {e}")
     print("  ✓ optuna_results.json → Volume")
     print("  ✓ optuna_study.db → Volume")
     print("  ✓ Updated config.yaml → Volume")
 
-    # ── Rsync to VPS (best-effort, non-fatal) ────────────────────────
+    # ── Rsync to VPS (fatal on failure) ───────────────────────────────
     print("\n--- Syncing results to VPS ---")
-    rsync_ok = True
+    key_path = get_ssh_key_path()
     try:
-        key_path = get_ssh_key_path()
-        try:
-            remote_jobs = config.infrastructure.jobs_remote_path.rstrip("/")
-            rsync_with_retry([
-                "rsync", "-az", "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
-                "--rsync-path", "mkdir -p /root/cnn_lstm_v1/jobs/tuning && rsync",
-                "/tmp/tuning/optuna_results.json",
-                remote_jobs + "/tuning/"
-            ])
-            rsync_with_retry([
-                "rsync", "-az", "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
-                "/tmp/tuning/optuna_study.db",
-                remote_jobs + "/tuning/"
-            ])
-            print("  ✓ optuna_results.json + optuna_study.db → VPS")
+        remote_jobs = config.infrastructure.jobs_remote_path.rstrip("/")
+        rsync_with_retry([
+            "rsync", "-az", "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
+            "--rsync-path", "mkdir -p /root/cnn_lstm_v1/jobs/tuning && rsync",
+            "/tmp/tuning/optuna_results.json",
+            remote_jobs + "/tuning/"
+        ])
+        rsync_with_retry([
+            "rsync", "-az", "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
+            "/tmp/tuning/optuna_study.db",
+            remote_jobs + "/tuning/"
+        ])
+        print("  ✓ optuna_results.json + optuna_study.db → VPS")
 
-            rsync_with_retry([
-                "rsync", "-az", "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
-                "/tmp/config.yaml",
-                config.infrastructure.config_remote_path
-            ])
-            print("  ✓ Updated config.yaml → VPS")
-        finally:
-            os.unlink(key_path)
-    except Exception as e:
-        rsync_ok = False
-        print(f"  ✗ Rsync to VPS failed (non-fatal, results saved to Volume): {e}")
+        rsync_with_retry([
+            "rsync", "-az", "-e", f"ssh -i {key_path} -o StrictHostKeyChecking=no",
+            "/tmp/config.yaml",
+            config.infrastructure.config_remote_path
+        ])
+        print("  ✓ Updated config.yaml → VPS")
+    finally:
+        os.unlink(key_path)
 
     log_gpu_timing("optuna_search", gpu_start_ts, 3600, 1800,
                    config.infrastructure.jobs_remote_path)
@@ -683,8 +677,6 @@ def run_optuna_search():
     print("\n" + "=" * 60)
     print(f"OPTUNA SEARCH COMPLETE — Best Sharpe: {study.best_trial.value:.4f}")
     print(f"Cost: ${(time.time() - gpu_start_ts) / 3600 * 6.25:.4f}")
-    if not rsync_ok:
-        print("NOTE: Results saved to Volume only — rsync to VPS failed")
     print("=" * 60)
 
     return optuna_results
