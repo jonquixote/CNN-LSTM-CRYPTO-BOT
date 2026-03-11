@@ -1,0 +1,187 @@
+# ── Active slots ─────────────────────────────────────────────────────────────
+active_slots:
+  - symbol: BTC
+    timeframe: 5m
+
+all_slots:
+  - { symbol: BTC,  timeframe: 5m  }
+  - { symbol: ETH,  timeframe: 5m  }
+  - { symbol: BTC,  timeframe: 15m }
+  - { symbol: ETH,  timeframe: 15m }
+
+# ── Labels ────────────────────────────────────────────────────────────────────
+labels:
+  type: binary_direction
+  # Class encoding — must match softmax output ordering in architecture.py.
+  # direction.py returns integer indices 0 or 1. Never +1/-1. Never strings.
+  # Strategy/execution layer uses strings "up"/"down". Conversion happens in ensemble.py.
+  class_down: 0    # close[t] < open[t]  → "Down"
+  class_up: 1      # close[t] >= open[t] → "Up"
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  sequence_length: 288
+  conv_filters: 256
+  lstm_hidden_dim: 512
+  lstm_layers: 2
+  attention_heads: 8
+  use_global_attention: true
+  dropout: 0.3
+  batch_size: 64
+  max_epochs: 100
+  early_stopping_patience: 10
+  learning_rate: 0.0005
+  ensemble_seeds: [0, 1, 2, 3, 4]
+  output_classes: 2
+
+# ── Training ──────────────────────────────────────────────────────────────────
+training:
+  train_window_days: 120
+  embargo_days: 10
+  val_window_days: 20
+  test_window_days: 10
+  fold_step_days: 10
+  min_folds: 12
+  min_history_days: 270              # 12 folds × 10-day step + 160-day initial window
+  scaler: RobustScaler
+
+# ── Backtest assumptions ──────────────────────────────────────────────────────
+backtest:
+  # Historical Polymarket market prices from Jon-Becker dataset.
+  # Coverage: BTC/ETH 5m/15m from ~late 2024. Verify before setting use_historical_prices: true.
+  # For bars with no historical price, assumed_market_price is used as fallback.
+  use_historical_prices: true
+  historical_prices_path: data/p_market_history.parquet
+  assumed_market_price: 0.50         # efficient-market null hypothesis fallback
+  # assumed_market_price = 0.50 means: edge = p_model - 0.50
+  # Backtest PnL using fallback is a LOWER BOUND — live prices may diverge from 0.50
+
+# ── Strategy ──────────────────────────────────────────────────────────────────
+strategy:
+  edge_threshold: 0.04               # min p_model - p_market to place bet
+  # US flat 0.10% fee → edge_threshold >= 0.02 is safe; 0.04 recommended for margin
+  # Non-US variable 1.56% peak → edge_threshold >= 0.06 required
+  min_model_confidence: 0.52
+  hurst_trend_threshold: 0.52
+  hurst_mean_reversion_threshold: 0.48
+  hurst_high_confidence_bonus: 0.58
+  threshold_hurst_adjustment: 0.03
+  seed_disagreement_max: 0.08
+  vol_zscore_threshold: 2.5
+  entropy_threshold: 0.95
+
+  # Multi-asset coherence
+  # Only active when ALL coherence_assets are in active_slots.
+  # "Signals Up/Down" = p_calibrated > coherence_confidence_threshold AND edge > 0.
+  # A weak lean is not sufficient.
+  coherence_assets: ["BTC", "ETH"]
+  coherence_required: true
+  coherence_confidence_threshold: 0.55
+  # What to do when a coherence asset has a gap (no signal available):
+  #   bypass       → treat coherence as passed for this bar; log coherence_status: "bypassed_gap"
+  #   suppress_all → block all bets this bar; log coherence_status: "failed_gap"
+  coherence_gap_behavior: bypass
+
+  min_market_liquidity_usd: 500
+  max_bid_ask_spread: 0.04
+  blackout_bars: 2
+
+  target_vol:
+    BTC: 0.0022
+    ETH: 0.0028
+  kelly_fraction_multiplier: 0.25
+  kelly_max_fraction: 0.15
+  kelly_recalibration_days: 10
+  daily_loss_limit_pct: 0.03
+  weekly_loss_limit_pct: 0.07
+  max_concurrent_positions: 4
+
+# ── Execution ─────────────────────────────────────────────────────────────────
+execution:
+  order_type: GTD
+  max_entry_seconds: 240
+  poll_interval_seconds: 5
+  heartbeat_interval_seconds: 5      # chain heartbeat_id every call; 400 is recoverable
+  stale_price_max_seconds: 30
+  tick_size_cache_ttl_seconds: 3600  # periodic refresh; also reset on tick_size_change event
+  retrying_max_minutes: 15           # after this, treat RETRYING trade as FAILED, refund stake
+  allow_mid_window_exit: false       # paper trading phase: all bets held to resolution
+
+# ── Fees ──────────────────────────────────────────────────────────────────────
+costs:
+  fee_model: us_flat
+  taker_fee_pct: 0.001               # 0.10% of contract premium
+  maker_rebate_pct: 0.001
+  min_fee_usdc: 0.0001               # Polymarket stated minimum; 0.0010 was incorrect
+  # Global variable fee (non-US reference only):
+  # fee_formula: "C * p * 0.25 * (p * (1-p))^2"
+  # max_fee_pct: 0.0156 at p=0.50 → raise edge_threshold to 0.06 minimum
+
+# ── Accounts ──────────────────────────────────────────────────────────────────
+# Each account applies Kelly sizing to its own portfolio_value independently.
+# position_fraction multiplies the final Kelly stake. 1.0 = full Kelly. 0.1 = 10%.
+accounts:
+  - id: account_a
+    key_env: POLY_KEY_A
+    position_fraction: 1.0
+    starting_capital: 100.0
+    logs_dir: logs/account_a/
+    state_dir: inference/state/account_a/
+  - id: account_b
+    key_env: POLY_KEY_B
+    position_fraction: 0.1
+    starting_capital: 10.0
+    logs_dir: logs/account_b/
+    state_dir: inference/state/account_b/
+
+# ── Inference ─────────────────────────────────────────────────────────────────
+inference:
+  artifacts_dir: inference/artifacts/
+  staging_dir: inference/staging/
+  bar_buffer_extra: 10
+  gap_tolerance_minutes: 0
+  maintenance_windows: []
+
+# ── Chainlink basis validation ────────────────────────────────────────────────
+chainlink:
+  basis_warn_bps: 15
+  basis_check_interval_hours: 24
+  basis_lookback_days: 7
+
+# ── Health monitoring ─────────────────────────────────────────────────────────
+health:
+  canary_accuracy_floor: 0.50
+  canary_lookback_days: 3
+  feature_kl_alert_threshold: 0.10
+  calibration_drift_alert_threshold: 0.05
+  live_pnl_alert_floor: -0.05        # alert if rolling 7-day net PnL < -5% of capital
+  alert_method: telegram             # telegram | slack | ntfy | log_only
+  alert_webhook_url: ""              # required unless log_only
+
+# ── Paper trading ─────────────────────────────────────────────────────────────
+paper_trading:
+  allow_mid_window_exit: false       # all bets held to resolution in paper phase
+
+# ── Paper trading gate ────────────────────────────────────────────────────────
+paper_trading_gate:
+  min_sharpe_60d: 1.0
+  max_drawdown_60d: 0.15
+  required_months: 3
+  min_drawdown_recovery_pct: 0.05
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+jobs:
+  retrain_day: Monday
+  retrain_hour_utc: 2
+  quarterly_retune_months: [1, 4, 7, 10]
+  calendar_source: nasdaq_api
+  calendar_api_url: https://api.nasdaq.com/api/calendar/economicevents
+  calendar_manual_path: strategy/events_manual.json
+  high_impact_event_filter: [FOMC, CPI, NFP, PPI, FOMC_MINUTES]
+
+# ── Infrastructure ────────────────────────────────────────────────────────────
+infrastructure:
+  gpu_platform: modal
+  inference_host: vps
+  artifact_sync: rsync
+  artifact_remote_path: "root@143.198.133.0:/root/cnn_lstm_v1/inference/artifacts/"
