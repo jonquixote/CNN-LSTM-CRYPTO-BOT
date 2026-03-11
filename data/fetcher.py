@@ -209,7 +209,13 @@ def fetch_funding_rate(
     all_records = []
     current_start = start_ms
 
-    logger.info(f"Fetching funding rate for {symbol}...")
+    proxy_url = os.getenv("PROXY_URL")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+    if proxy_url:
+        logger.info(f"Fetching funding rate for {symbol} (via proxy {proxy_url})...")
+    else:
+        logger.info(f"Fetching funding rate for {symbol}...")
 
     while current_start < end_ms:
         for attempt in range(max_retries):
@@ -222,6 +228,7 @@ def fetch_funding_rate(
                         'endTime': end_ms,
                         'limit': 1000,
                     },
+                    proxies=proxies,
                     timeout=30,
                 )
                 resp.raise_for_status()
@@ -283,7 +290,13 @@ def fetch_open_interest(
     all_records = []
     current_start = start_ms
 
-    logger.info(f"Fetching open interest for {symbol} ({period})...")
+    proxy_url = os.getenv("PROXY_URL")
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+    if proxy_url:
+        logger.info(f"Fetching open interest for {symbol} ({period}) (via proxy {proxy_url})...")
+    else:
+        logger.info(f"Fetching open interest for {symbol} ({period})...")
 
     while current_start < end_ms:
         for attempt in range(max_retries):
@@ -297,6 +310,7 @@ def fetch_open_interest(
                         'endTime': end_ms,
                         'limit': 500,
                     },
+                    proxies=proxies,
                     timeout=30,
                 )
                 resp.raise_for_status()
