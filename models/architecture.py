@@ -54,19 +54,23 @@ class CausalConv1d(nn.Module):
 
 
 class MultiScaleCNN(nn.Module):
-    """Multi-scale Conv1D with kernels 3, 7, 15 and causal padding."""
+    """Multi-scale Conv1D with kernels 3, 7, 15 and causal padding.
+
+    Uses LayerNorm (not BatchNorm) for training stability at variable
+    sequence lengths — correct choice for causal Conv at seq 500/750/1000.
+    """
 
     def __init__(self, n_features: int, filters: int, dropout: float):
         super().__init__()
         # Three parallel causal conv branches
         self.conv3 = CausalConv1d(n_features, filters, kernel_size=3)
-        self.bn3 = nn.BatchNorm1d(filters)
-
         self.conv7 = CausalConv1d(n_features, filters, kernel_size=7)
-        self.bn7 = nn.BatchNorm1d(filters)
-
         self.conv15 = CausalConv1d(n_features, filters, kernel_size=15)
-        self.bn15 = nn.BatchNorm1d(filters)
+
+        # LayerNorm applied per-channel (filters dimension)
+        self.ln3 = nn.LayerNorm(filters)
+        self.ln7 = nn.LayerNorm(filters)
+        self.ln15 = nn.LayerNorm(filters)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -74,16 +78,16 @@ class MultiScaleCNN(nn.Module):
         # x: (batch, seq_len, n_features)
         x = x.permute(0, 2, 1)  # → (batch, n_features, seq_len)
 
-        c3 = F.gelu(self.bn3(self.conv3(x)))
-        c7 = F.gelu(self.bn7(self.conv7(x)))
-        c15 = F.gelu(self.bn15(self.conv15(x)))
+        # Conv → permute → LayerNorm → GELU
+        c3 = F.gelu(self.ln3(self.conv3(x).permute(0, 2, 1)))   # (batch, seq_len, filters)
+        c7 = F.gelu(self.ln7(self.conv7(x).permute(0, 2, 1)))   # (batch, seq_len, filters)
+        c15 = F.gelu(self.ln15(self.conv15(x).permute(0, 2, 1))) # (batch, seq_len, filters)
 
-        # Concatenate → (batch, filters*3, seq_len)
-        out = torch.cat([c3, c7, c15], dim=1)
+        # Concatenate → (batch, seq_len, filters*3)
+        out = torch.cat([c3, c7, c15], dim=2)
         out = self.dropout(out)
 
-        # → (batch, seq_len, filters*3)
-        return out.permute(0, 2, 1)
+        return out  # (batch, seq_len, filters*3)
 
 
 class CNNBiLSTMAttention(nn.Module):

@@ -20,14 +20,14 @@ labels:
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model:
-  sequence_length: 288
+  sequence_length: 750
   conv_filters: 256
   lstm_hidden_dim: 512
   lstm_layers: 2
   attention_heads: 8
   use_global_attention: true
   dropout: 0.3
-  batch_size: 64
+  batch_size: 1024
   max_epochs: 100
   early_stopping_patience: 10
   learning_rate: 0.0005
@@ -182,6 +182,11 @@ jobs:
 # ── Infrastructure ────────────────────────────────────────────────────────────
 infrastructure:
   gpu_platform: modal
+  gpu_type: B200
   inference_host: vps
   artifact_sync: rsync
   artifact_remote_path: "root@143.198.133.0:/root/cnn_lstm_v1/inference/artifacts/"
+  jobs_remote_path: "root@143.198.133.0:/root/cnn_lstm_v1/jobs/"
+  config_remote_path: "root@143.198.133.0:/root/cnn_lstm_v1/config.yaml"
+  modal_volume_name: "cnn-lstm-data"
+  modal_volume_mount: "/data"

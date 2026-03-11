@@ -187,6 +187,228 @@ def validate_history(df: pd.DataFrame, timeframe: str = '5m', min_days: int = 27
     return result
 
 
+# ── Funding Rate ──────────────────────────────────────────────────────────────
+
+def fetch_funding_rate(
+    symbol: str = 'BTCUSDT',
+    since_days: int = 280,
+    max_retries: int = 3,
+) -> pd.DataFrame:
+    """
+    Fetch funding rate from Binance Futures.
+
+    Funding events occur every 8 hours. Returns a DataFrame with
+    columns: timestamp, funding_rate. Forward-fill to bar frequency
+    is done in merge_supplementary_data().
+    """
+    import requests
+
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=since_days)).timestamp() * 1000)
+
+    all_records = []
+    current_start = start_ms
+
+    logger.info(f"Fetching funding rate for {symbol}...")
+
+    while current_start < end_ms:
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(
+                    'https://fapi.binance.com/fapi/v1/fundingRate',
+                    params={
+                        'symbol': symbol,
+                        'startTime': current_start,
+                        'endTime': end_ms,
+                        'limit': 1000,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                logger.warning(f"Funding rate retry {attempt+1}/{max_retries}: {e}")
+                time.sleep(2 ** attempt)
+        else:
+            logger.warning("Failed to fetch funding rate after retries")
+            return pd.DataFrame(columns=['timestamp', 'funding_rate'])
+
+        if not data:
+            break
+
+        for record in data:
+            all_records.append({
+                'timestamp': record['fundingTime'],
+                'funding_rate': float(record['fundingRate']),
+            })
+
+        current_start = data[-1]['fundingTime'] + 1
+        time.sleep(0.2)
+
+    if not all_records:
+        logger.warning("No funding rate data returned")
+        return pd.DataFrame(columns=['timestamp', 'funding_rate'])
+
+    df = pd.DataFrame(all_records)
+    df = df.drop_duplicates(subset='timestamp').sort_values('timestamp').reset_index(drop=True)
+    logger.info(f"Fetched {len(df)} funding rate records")
+    return df
+
+
+def fetch_open_interest(
+    symbol: str = 'BTCUSDT',
+    period: str = '5m',
+    since_days: int = 30,
+    max_retries: int = 3,
+) -> pd.DataFrame:
+    """
+    Fetch open interest history from Binance Futures.
+
+    Available at 5m resolution. Binance limits to ~500 records per request
+    and max 30 days history for this endpoint.
+
+    Returns DataFrame with columns: timestamp, open_interest
+    """
+    import requests
+
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=min(since_days, 30))).timestamp() * 1000)
+
+    all_records = []
+    current_start = start_ms
+
+    logger.info(f"Fetching open interest for {symbol} ({period})...")
+
+    while current_start < end_ms:
+        for attempt in range(max_retries):
+            try:
+                resp = requests.get(
+                    'https://fapi.binance.com/futures/data/openInterestHist',
+                    params={
+                        'symbol': symbol,
+                        'period': period,
+                        'startTime': current_start,
+                        'endTime': end_ms,
+                        'limit': 500,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                logger.warning(f"Open interest retry {attempt+1}/{max_retries}: {e}")
+                time.sleep(2 ** attempt)
+        else:
+            logger.warning("Failed to fetch open interest after retries")
+            return pd.DataFrame(columns=['timestamp', 'open_interest'])
+
+        if not data:
+            break
+
+        for record in data:
+            all_records.append({
+                'timestamp': record['timestamp'],
+                'open_interest': float(record['sumOpenInterest']),
+            })
+
+        current_start = data[-1]['timestamp'] + 1
+        time.sleep(0.5)  # This endpoint is more rate-limited
+
+    if not all_records:
+        logger.warning("No open interest data returned")
+        return pd.DataFrame(columns=['timestamp', 'open_interest'])
+
+    df = pd.DataFrame(all_records)
+    df = df.drop_duplicates(subset='timestamp').sort_values('timestamp').reset_index(drop=True)
+    logger.info(f"Fetched {len(df)} open interest records")
+    return df
+
+
+def fetch_sol_ohlcv(
+    timeframe: str = '5m',
+    since_days: int = 280,
+) -> pd.DataFrame:
+    """Fetch SOL/USDT OHLCV for cross-asset features."""
+    return fetch_ohlcv('SOL/USDT', timeframe, since_days)
+
+
+def merge_supplementary_data(
+    df: pd.DataFrame,
+    funding_df: Optional[pd.DataFrame] = None,
+    oi_df: Optional[pd.DataFrame] = None,
+    sol_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """
+    Merge funding rate, open interest, and SOL data onto the main OHLCV DataFrame.
+
+    All supplementary data is aligned to the main bar index via merge_asof
+    (forward-fill for funding rate) or left join + ffill (OI, SOL).
+    Does not drop any bars from the main DataFrame.
+
+    Args:
+        df: Main OHLCV DataFrame with 'timestamp' column
+        funding_df: Funding rate DataFrame (timestamp, funding_rate)
+        oi_df: Open interest DataFrame (timestamp, open_interest)
+        sol_df: SOL OHLCV DataFrame (timestamp, open, high, low, close, volume)
+
+    Returns:
+        Main DataFrame with supplementary columns added
+    """
+    result = df.copy()
+
+    # Funding rate — forward-fill from 8h events onto 5m bars
+    if funding_df is not None and len(funding_df) > 0:
+        funding_df = funding_df.sort_values('timestamp')
+        result = pd.merge_asof(
+            result.sort_values('timestamp'),
+            funding_df[['timestamp', 'funding_rate']],
+            on='timestamp',
+            direction='backward',
+        )
+        result['funding_rate'] = result['funding_rate'].ffill().fillna(0)
+        logger.info(f"Merged funding rate ({len(funding_df)} events)")
+    else:
+        result['funding_rate'] = 0.0
+        logger.info("No funding rate data — filled with 0")
+
+    # Open interest — join on timestamp, ffill gaps
+    if oi_df is not None and len(oi_df) > 0:
+        oi_df = oi_df.sort_values('timestamp')
+        result = pd.merge_asof(
+            result.sort_values('timestamp'),
+            oi_df[['timestamp', 'open_interest']],
+            on='timestamp',
+            direction='backward',
+        )
+        result['open_interest'] = result['open_interest'].ffill().fillna(0)
+        logger.info(f"Merged open interest ({len(oi_df)} records)")
+    else:
+        result['open_interest'] = 0.0
+        logger.info("No open interest data — filled with 0")
+
+    # SOL close — merge onto BTC bar index, ffill gaps
+    if sol_df is not None and len(sol_df) > 0:
+        sol_df = sol_df.sort_values('timestamp')
+        sol_renamed = sol_df[['timestamp', 'close']].rename(columns={'close': 'sol_close'})
+        result = pd.merge_asof(
+            result.sort_values('timestamp'),
+            sol_renamed,
+            on='timestamp',
+            direction='backward',
+        )
+        result['sol_close'] = result['sol_close'].ffill()
+        logger.info(f"Merged SOL close ({len(sol_df)} bars)")
+    else:
+        result['sol_close'] = np.nan
+        logger.info("No SOL data — sol_close is NaN")
+
+    # Restore original order
+    result = result.sort_values('timestamp').reset_index(drop=True)
+    return result
+
+
 # ── Chainlink Basis Validation ────────────────────────────────────────────────
 # Training uses Binance OHLCV. Polymarket settles on Chainlink BTC/USD CX-Price
 # Data Stream. Chainlink can lag during fast markets due to aggregation.

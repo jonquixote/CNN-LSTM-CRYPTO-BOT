@@ -1,16 +1,24 @@
 """
 data/features.py — All feature engineering (training = inference).
 
-Single source of truth for ~33-40 features per symbol/TF.
+Single source of truth for ~55 features per symbol/TF.
 Same code used at training time and inference time.
 No lookahead: all features use only data up to and including bar t.
 
-Features (§5 of spec):
+Features (§5 of spec + prompt2 expansion):
   5.1 — Price & Volume Derivatives
   5.2 — Microstructure-Lite
   5.3 — Volatility & Regime
   5.4 — Technical Indicators
   5.5 — Cross-Asset (stubbed for single-asset phase)
+  G1  — Funding Rate & Open Interest
+  G2  — Wick Structure
+  G3  — Temporal Encoding
+  G4  — Price Action
+  G5  — Signed Volume
+  G6  — Rolling Return Statistics
+  G7  — Distance from Moving Averages
+  G8  — Cross-Asset SOL
 """
 
 import hashlib
@@ -352,6 +360,225 @@ def build_cross_asset_features(
     return features
 
 
+# ── Group 1: Funding Rate & Open Interest ────────────────────────────────────
+
+def build_funding_oi_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    G1 — Funding Rate & Open Interest features.
+
+    Requires 'funding_rate' and 'open_interest' columns in df,
+    added by fetcher.merge_supplementary_data() before this is called.
+    """
+    features = pd.DataFrame(index=df.index)
+
+    # funding_rate — raw, already forward-filled from 8h events
+    if 'funding_rate' in df.columns:
+        funding_rate = df['funding_rate']
+        features['funding_rate'] = funding_rate
+
+        # funding_rate_zscore — window=500, zero-std guard
+        rolling_std = funding_rate.rolling(500).std().replace(0, np.nan)
+        features['funding_rate_zscore'] = (
+            (funding_rate - funding_rate.rolling(500).mean()) / rolling_std
+        ).fillna(0)
+    else:
+        features['funding_rate'] = 0.0
+        features['funding_rate_zscore'] = 0.0
+
+    # OI features — timestamps represent bar-open snapshots (no shift needed)
+    if 'open_interest' in df.columns:
+        oi = df['open_interest']
+        oi_delta = oi.diff(1)
+        features['oi_delta'] = oi_delta
+
+        # oi_delta_zscore — window=50
+        oi_std = oi_delta.rolling(50).std().replace(0, np.nan)
+        features['oi_delta_zscore'] = (
+            (oi_delta - oi_delta.rolling(50).mean()) / oi_std
+        ).fillna(0)
+
+        # signed_oi_delta — directional OI pressure using PREVIOUS bar's direction
+        prev_direction = np.sign(df['close'].shift(1) - df['open'].shift(1))
+        features['signed_oi_delta'] = oi_delta * prev_direction
+    else:
+        features['oi_delta'] = 0.0
+        features['oi_delta_zscore'] = 0.0
+        features['signed_oi_delta'] = 0.0
+
+    return features
+
+
+# ── Group 2: Wick Structure ──────────────────────────────────────────────────
+
+def build_wick_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    G2 — Wick Structure features.
+
+    All use PREVIOUS bar's OHLCV — current bar high/low/close unknown at bar open.
+    """
+    features = pd.DataFrame(index=df.index)
+
+    h = df['high'].shift(1)
+    l = df['low'].shift(1)
+    o = df['open'].shift(1)
+    c = df['close'].shift(1)
+    range_ = (h - l).replace(0, np.nan)  # guard zero-range bars
+
+    features['upper_wick_pct'] = ((h - np.maximum(o, c)) / range_).fillna(0)
+    features['lower_wick_pct'] = ((np.minimum(o, c) - l) / range_).fillna(0)
+    features['wick_imbalance'] = features['upper_wick_pct'] - features['lower_wick_pct']
+
+    return features
+
+
+# ── Group 3: Temporal Encoding ───────────────────────────────────────────────
+
+def build_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    G3 — Temporal Encoding features.
+
+    Cyclical sin/cos encoding of hour-of-day and day-of-week.
+    Derived from bar's UTC timestamp. No leakage concern.
+    """
+    features = pd.DataFrame(index=df.index)
+
+    # Convert timestamp (ms) to datetime
+    dt = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    hour = dt.dt.hour + dt.dt.minute / 60.0  # fractional hour
+    dow = dt.dt.dayofweek  # Monday=0, Sunday=6
+
+    features['hour_sin'] = np.sin(2 * np.pi * hour / 24)
+    features['hour_cos'] = np.cos(2 * np.pi * hour / 24)
+    features['dow_sin'] = np.sin(2 * np.pi * dow / 7)
+    features['dow_cos'] = np.cos(2 * np.pi * dow / 7)
+
+    return features
+
+
+# ── Group 4: Price Action ────────────────────────────────────────────────────
+
+def build_price_action_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    G4 — Price Action features.
+
+    prev_bar_direction: {-1, 0, 1} — always uses PREVIOUS bar (current bar = label).
+    streak_count: consecutive bars in same direction, signed.
+    """
+    features = pd.DataFrame(index=df.index)
+
+    # Previous bar direction — current bar direction IS the label → shift
+    direction = np.sign(df['close'].shift(1) - df['open'].shift(1))
+    features['prev_bar_direction'] = direction
+
+    # streak_count — vectorized, no Python row loop
+    streak_id = (direction != direction.shift(1)).cumsum()
+    features['streak_count'] = direction.groupby(streak_id).cumcount().add(1) * direction
+
+    return features
+
+
+# ── Group 5: Signed Volume ───────────────────────────────────────────────────
+
+def build_signed_volume_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    G5 — Signed Volume features.
+
+    All use PREVIOUS bar's volume and direction — current bar unknown at open.
+    """
+    features = pd.DataFrame(index=df.index)
+
+    prev_direction = np.sign(df['close'].shift(1) - df['open'].shift(1))
+    signed_volume = df['volume'].shift(1) * prev_direction
+    features['signed_volume'] = signed_volume
+
+    # Rolling sums, z-scored with window=100
+    for window in [5, 15]:
+        rolling_sum = signed_volume.rolling(window).sum()
+        rs_mean = rolling_sum.rolling(100).mean()
+        rs_std = rolling_sum.rolling(100).std().replace(0, np.nan)
+        features[f'signed_volume_sum_{window}'] = (
+            (rolling_sum - rs_mean) / rs_std
+        ).fillna(0)
+
+    return features
+
+
+# ── Group 6: Rolling Return Statistics ───────────────────────────────────────
+
+def build_return_stat_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    G6 — Rolling Return Statistics.
+
+    Uses ret_1 = log(close/close.shift(1)).shift(1) — the LAGGED 1-bar return.
+    Existing log_return_1 uses close[t] and is NOT outer-shifted.
+    We compute our own lagged version to avoid leakage.
+    """
+    features = pd.DataFrame(index=df.index)
+
+    # ret_1: 1-bar log return, lagged one bar to avoid leakage
+    # log_return_1 = log(close[t] / close[t-1]) uses close[t] → leaky
+    # ret_1 = log(close[t-1] / close[t-2]) = log_return_1.shift(1)
+    ret_1 = np.log(df['close'] / df['close'].shift(1)).shift(1)
+
+    features['return_skewness_30'] = ret_1.rolling(30).skew()
+    features['return_percentile_100'] = ret_1.rolling(100).rank(pct=True)
+
+    return features
+
+
+# ── Group 7: Distance from Moving Averages ───────────────────────────────────
+
+def build_ma_distance_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    G7 — Distance from Moving Averages.
+
+    EMA at time t includes close[t], so the entire series is shifted 1 bar.
+    """
+    features = pd.DataFrame(index=df.index)
+
+    close = df['close']
+    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema200 = close.ewm(span=200, adjust=False).mean()
+
+    features['dist_from_ma50'] = ((close - ema50) / close).shift(1)
+    features['dist_from_ma200'] = ((close - ema200) / close).shift(1)
+
+    return features
+
+
+# ── Group 8: Cross-Asset SOL ─────────────────────────────────────────────────
+
+def build_sol_cross_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    G8 — Cross-Asset SOL features (BTC model only).
+
+    Requires 'sol_close' column in df, added by fetcher.merge_supplementary_data().
+    When SOL data is unavailable, returns zeros.
+    """
+    features = pd.DataFrame(index=df.index)
+
+    if 'sol_close' in df.columns and df['sol_close'].notna().any():
+        sol_close = df['sol_close']
+
+        # SOL returns at lags 1, 3, 6 — all lagged 1 additional bar
+        sol_ret_lag1 = np.log(sol_close / sol_close.shift(1)).shift(1)
+        features['sol_ret_lag1'] = sol_ret_lag1
+        features['sol_ret_lag3'] = np.log(sol_close / sol_close.shift(3)).shift(1)
+        features['sol_ret_lag6'] = np.log(sol_close / sol_close.shift(6)).shift(1)
+
+        # BTC-SOL rolling correlation — both inputs already pre-lagged
+        ret_1 = np.log(df['close'] / df['close'].shift(1)).shift(1)
+        features['btc_sol_corr_50'] = ret_1.rolling(50).corr(sol_ret_lag1)
+    else:
+        features['sol_ret_lag1'] = 0.0
+        features['sol_ret_lag3'] = 0.0
+        features['sol_ret_lag6'] = 0.0
+        features['btc_sol_corr_50'] = 0.0
+        logger.info("SOL cross-asset features: skipped (no sol_close data)")
+
+    return features
+
+
 # ── Main Feature Builder ─────────────────────────────────────────────────────
 
 def build_features(
@@ -363,23 +590,38 @@ def build_features(
 
     Args:
         df: OHLCV DataFrame with columns: timestamp, open, high, low, close, volume
-        cross_df: Optional cross-asset OHLCV for cross-asset features
+            Optionally includes: funding_rate, open_interest, sol_close
+            (added by fetcher.merge_supplementary_data())
+        cross_df: Optional cross-asset OHLCV for legacy cross-asset features
 
     Returns:
         DataFrame with all features. Same length as input, but early rows will
         have NaNs due to lookback windows.
     """
     features = pd.concat([
+        # Original feature groups (§5 of spec)
         build_price_volume_features(df),
         build_microstructure_features(df),
         build_volatility_regime_features(df),
         build_technical_features(df),
         build_cross_asset_features(df, cross_df),
+        # Expanded feature groups (prompt2)
+        build_funding_oi_features(df),
+        build_wick_features(df),
+        build_temporal_features(df),
+        build_price_action_features(df),
+        build_signed_volume_features(df),
+        build_return_stat_features(df),
+        build_ma_distance_features(df),
+        build_sol_cross_features(df),
     ], axis=1)
 
     # Forward-fill any residual NaNs after warmup period, then backfill the rest.
     # This handles edge cases where rolling windows produce isolated NaNs.
     features = features.ffill().bfill()
+
+    # Final safety: fill any remaining NaN/inf with 0
+    features = features.replace([np.inf, -np.inf], 0).fillna(0)
 
     feature_names = sorted(features.columns.tolist())
     logger.info(f"Built {len(feature_names)} features")

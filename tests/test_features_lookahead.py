@@ -204,10 +204,10 @@ class TestFeatureProperties:
         assert len(problem_cols) == 0, f"NaN values after warmup in: {problem_cols.to_dict()}"
 
     def test_feature_count_range(self, synthetic_data):
-        """Should have ~33-40 features per spec."""
+        """Should have ~55 features after expansion."""
         features = build_features(synthetic_data)
         n_features = len(features.columns)
-        assert 30 <= n_features <= 45, f"Expected 30-45 features, got {n_features}"
+        assert 50 <= n_features <= 70, f"Expected 50-70 features, got {n_features}"
 
     def test_same_length_as_input(self, synthetic_data):
         """Feature DataFrame must have same length as input."""
@@ -215,5 +215,99 @@ class TestFeatureProperties:
         assert len(features) == len(synthetic_data)
 
 
+class TestNewFeatureSmoke:
+    """Smoke tests for prompt2 expanded features."""
+
+    @pytest.fixture
+    def synthetic_data(self):
+        df = _generate_synthetic_ohlcv(n_bars=2000)
+        # Add supplementary columns that new features expect
+        df['funding_rate'] = np.random.normal(0.0001, 0.0005, len(df))
+        df['open_interest'] = np.abs(np.random.normal(50000, 5000, len(df))) * 1e6
+        df['sol_close'] = 150 * np.exp(np.cumsum(np.random.normal(0, 0.003, len(df))))
+        return df
+
+    def test_all_new_feature_names_present(self, synthetic_data):
+        """All new feature names from prompt2 must be present."""
+        features = build_features(synthetic_data)
+        expected = [
+            # Group 1
+            'funding_rate', 'funding_rate_zscore', 'oi_delta',
+            'oi_delta_zscore', 'signed_oi_delta',
+            # Group 2
+            'upper_wick_pct', 'lower_wick_pct', 'wick_imbalance',
+            # Group 3
+            'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
+            # Group 4
+            'prev_bar_direction', 'streak_count',
+            # Group 5
+            'signed_volume', 'signed_volume_sum_5', 'signed_volume_sum_15',
+            # Group 6
+            'return_skewness_30', 'return_percentile_100',
+            # Group 7
+            'dist_from_ma50', 'dist_from_ma200',
+            # Group 8
+            'sol_ret_lag1', 'sol_ret_lag3', 'sol_ret_lag6', 'btc_sol_corr_50',
+        ]
+        missing = [f for f in expected if f not in features.columns]
+        assert len(missing) == 0, f"Missing features: {missing}"
+
+    def test_no_nan_after_warmup(self, synthetic_data):
+        """No NaN values in new features after warmup."""
+        features = build_features(synthetic_data)
+        warmup = get_warmup_bars()
+        post_warmup = features.iloc[warmup:]
+        nan_counts = post_warmup.isna().sum()
+        problem_cols = nan_counts[nan_counts > 0]
+        assert len(problem_cols) == 0, f"NaN after warmup: {problem_cols.to_dict()}"
+
+    def test_upper_wick_pct_range(self, synthetic_data):
+        """upper_wick_pct must be in [0, 1]."""
+        features = build_features(synthetic_data)
+        warmup = get_warmup_bars()
+        col = features['upper_wick_pct'].iloc[warmup:]
+        assert col.min() >= -1e-10, f"upper_wick_pct min={col.min()}"
+        assert col.max() <= 1 + 1e-10, f"upper_wick_pct max={col.max()}"
+
+    def test_lower_wick_pct_range(self, synthetic_data):
+        """lower_wick_pct must be in [0, 1]."""
+        features = build_features(synthetic_data)
+        warmup = get_warmup_bars()
+        col = features['lower_wick_pct'].iloc[warmup:]
+        assert col.min() >= -1e-10, f"lower_wick_pct min={col.min()}"
+        assert col.max() <= 1 + 1e-10, f"lower_wick_pct max={col.max()}"
+
+    def test_temporal_features_range(self, synthetic_data):
+        """Temporal sin/cos features must be in [-1, 1]."""
+        features = build_features(synthetic_data)
+        for col_name in ['hour_sin', 'hour_cos', 'dow_sin', 'dow_cos']:
+            col = features[col_name]
+            assert col.min() >= -1 - 1e-10, f"{col_name} min={col.min()}"
+            assert col.max() <= 1 + 1e-10, f"{col_name} max={col.max()}"
+
+    def test_return_percentile_range(self, synthetic_data):
+        """return_percentile_100 must be in [0, 1]."""
+        features = build_features(synthetic_data)
+        warmup = get_warmup_bars()
+        col = features['return_percentile_100'].iloc[warmup:]
+        assert col.min() >= -1e-10, f"return_percentile_100 min={col.min()}"
+        assert col.max() <= 1 + 1e-10, f"return_percentile_100 max={col.max()}"
+
+    def test_funding_rate_zscore_no_inf(self, synthetic_data):
+        """funding_rate_zscore must have no inf values."""
+        features = build_features(synthetic_data)
+        assert not np.isinf(features['funding_rate_zscore']).any(), \
+            "funding_rate_zscore contains inf values"
+
+    def test_no_inf_in_any_new_feature(self, synthetic_data):
+        """No infinite values in any new feature."""
+        features = build_features(synthetic_data)
+        inf_mask = np.isinf(features.select_dtypes(include=[np.number]))
+        inf_counts = inf_mask.sum()
+        problem_cols = inf_counts[inf_counts > 0]
+        assert len(problem_cols) == 0, f"Inf values in: {problem_cols.to_dict()}"
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+

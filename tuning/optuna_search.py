@@ -1,5 +1,5 @@
 """
-tuning/optuna_search.py — Hyperparameter search with Optuna + Hyperband.
+tuning/optuna_search.py — Hyperparameter search with Optuna + MedianPruner.
 
 Per spec §10:
     Initial: 100 trials, objective = mean Val Sharpe across 6 folds
@@ -25,7 +25,7 @@ from typing import Optional
 
 import numpy as np
 import optuna
-from optuna.pruners import HyperbandPruner
+from optuna.pruners import MedianPruner
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -155,12 +155,17 @@ def create_objective(
             metrics = compute_fold_metrics(p_up, y_val_aligned, p_market, config)
             val_sharpes.append(metrics.get('sharpe', 0.0))
 
-            # Pruning: report intermediate and prune if Sharpe < 0 after fold 3
+            # Pruning: report intermediate and check gates
             trial.report(np.mean(val_sharpes), fold_idx)
-            if fold_idx >= 2 and np.mean(val_sharpes) < 0:
+
+            # Hard Sharpe gate fires after fold 3 (index 2) only
+            if fold_idx == 2 and np.mean(val_sharpes) < 0:
+                trial.set_user_attr("pruned_by", "sharpe_gate")
                 raise optuna.exceptions.TrialPruned()
 
+            # MedianPruner check after every fold
             if trial.should_prune():
+                trial.set_user_attr("pruned_by", "median_pruner")
                 raise optuna.exceptions.TrialPruned()
 
         mean_sharpe = float(np.mean(val_sharpes))
@@ -198,11 +203,7 @@ def run_search(
     study = optuna.create_study(
         study_name=study_name,
         direction='maximize',
-        pruner=HyperbandPruner(
-            min_resource=1,
-            max_resource=6,
-            reduction_factor=3,
-        ),
+        pruner=MedianPruner(),
     )
 
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)

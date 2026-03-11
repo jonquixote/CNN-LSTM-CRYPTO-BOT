@@ -28,32 +28,66 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _get_xgb_gpu_params() -> dict:
+    """Get XGBoost GPU parameters with version-conditional logic.
+
+    XGBoost >=2.0.0 uses {"device": "cuda"}.
+    XGBoost <2.0.0 uses {"tree_method": "gpu_hist"}.
+    Do not specify both — XGBoost will raise an error.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return {"device": "cpu", "tree_method": "hist"}
+    except ImportError:
+        return {"device": "cpu", "tree_method": "hist"}
+
+    import xgboost as xgb
+    from packaging import version
+    if version.parse(xgb.__version__) >= version.parse("2.0.0"):
+        return {"device": "cuda"}
+    else:
+        return {"tree_method": "gpu_hist"}
+
+
 class BorutaSHAP:
     """
     Boruta-style feature selection using SHAP values.
 
     Instead of original Boruta's Gini importance, uses SHAP values from
     XGBoost/CatBoost for more accurate feature importance estimates.
+
+    Production specification:
+        - n_shadow_iterations: 50 (conservative, auditable default)
+        - n_estimators: 200
+        - SHAP computed across all training instances (no subsampling)
+        - Feature confirmation via binomial test (no early stopping)
     """
 
     def __init__(
         self,
-        n_trials: int = 100,
+        n_shadow_iterations: int = 50,
         alpha: float = 0.05,
         use_catboost: bool = False,
         random_state: int = 42,
+        n_estimators: int = 200,
+        max_depth: int = 6,
     ):
         """
         Args:
-            n_trials: Number of Boruta iterations
+            n_shadow_iterations: Number of Boruta shadow iterations (spec: 50)
             alpha: Statistical significance level
             use_catboost: Use CatBoost instead of XGBoost
             random_state: Random seed for reproducibility
+            n_estimators: Number of trees in base estimator
+            max_depth: Max tree depth in base estimator
         """
-        self.n_trials = n_trials
+        self.n_shadow_iterations = n_shadow_iterations
         self.alpha = alpha
         self.use_catboost = use_catboost
         self.random_state = random_state
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
         self.accepted_features: list[str] = []
         self.rejected_features: list[str] = []
         self.tentative_features: list[str] = []
@@ -75,8 +109,8 @@ class BorutaSHAP:
         if self.use_catboost:
             from catboost import CatBoostClassifier
             model = CatBoostClassifier(
-                iterations=200,
-                depth=6,
+                iterations=self.n_estimators,
+                depth=self.max_depth,
                 learning_rate=0.1,
                 verbose=0,
                 random_seed=self.random_state,
@@ -84,16 +118,16 @@ class BorutaSHAP:
             )
         else:
             from xgboost import XGBClassifier
+            xgb_gpu_param = _get_xgb_gpu_params()
             model = XGBClassifier(
-                n_estimators=200,
-                max_depth=6,
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
                 learning_rate=0.1,
                 use_label_encoder=False,
                 eval_metric='logloss',
                 random_state=self.random_state,
-                tree_method='hist',
-                device='cuda' if _gpu_available_xgb() else 'cpu',
                 verbosity=0,
+                **xgb_gpu_param,
             )
 
         n_features = X.shape[1]
@@ -103,10 +137,15 @@ class BorutaSHAP:
         hits = np.zeros(n_features, dtype=int)
 
         logger.info(
-            "Starting Boruta-SHAP: {} features, {} trials".format(n_features, self.n_trials)
+            "Starting Boruta-SHAP: {} features, {} shadow iterations, "
+            "n_estimators={}, max_depth={}, GPU={}".format(
+                n_features, self.n_shadow_iterations,
+                self.n_estimators, self.max_depth,
+                'cuda' if _gpu_available_xgb() else 'cpu'
+            )
         )
 
-        for trial in range(self.n_trials):
+        for trial in range(self.n_shadow_iterations):
             # Create shadow features by shuffling each column
             X_shadow = X.apply(np.random.permutation).copy()
             X_shadow.columns = ['shadow_' + c for c in feature_names]
@@ -117,12 +156,8 @@ class BorutaSHAP:
             # Fit model
             model.fit(X_combined, y)
 
-            # Compute SHAP values
-            if self.use_catboost:
-                explainer = shap.TreeExplainer(model)
-            else:
-                explainer = shap.TreeExplainer(model)
-
+            # Compute SHAP values — full dataset, no subsampling
+            explainer = shap.TreeExplainer(model)
             shap_values = explainer.shap_values(X_combined)
 
             # For binary classification, shap_values may be a list [class_0, class_1]
@@ -142,16 +177,23 @@ class BorutaSHAP:
             # Count hits
             hits += (real_shap > shadow_max).astype(int)
 
-            if (trial + 1) % 20 == 0:
-                logger.info("  Trial {}/{}".format(trial + 1, self.n_trials))
+            if (trial + 1) % 10 == 0:
+                logger.info("  Shadow iteration {}/{}".format(
+                    trial + 1, self.n_shadow_iterations
+                ))
 
         # Statistical test: binomial test at alpha significance
+        # No early stopping — run full confirmation across all iterations
         from scipy import stats
 
         for i, feat_name in enumerate(feature_names):
             # Under null hypothesis, P(hit) = 0.5
-            p_value = stats.binomtest(hits[i], self.n_trials, 0.5, alternative='greater').pvalue
-            self.feature_importances[feat_name] = float(hits[i] / self.n_trials)
+            p_value = stats.binomtest(
+                hits[i], self.n_shadow_iterations, 0.5, alternative='greater'
+            ).pvalue
+            self.feature_importances[feat_name] = float(
+                hits[i] / self.n_shadow_iterations
+            )
 
             if p_value < self.alpha:
                 self.accepted_features.append(feat_name)
@@ -181,7 +223,9 @@ class BorutaSHAP:
             'rejected': sorted(self.rejected_features),
             'tentative': sorted(self.tentative_features),
             'importances': self.feature_importances,
-            'n_trials': self.n_trials,
+            'n_shadow_iterations': self.n_shadow_iterations,
+            'n_estimators': self.n_estimators,
+            'max_depth': self.max_depth,
             'alpha': self.alpha,
         }
 
@@ -197,6 +241,8 @@ def save_feature_list(
     Per spec §5.6: feature_list.json versioned with SHA-256 hash.
     Per spec §20 rule 20: always SHA-256 of sorted JSON content.
 
+    Hash uses sorted() + separators=(',', ':') for cross-environment determinism.
+
     Args:
         feature_names: List of accepted feature names
         output_dir: Directory to save to (defaults to project root)
@@ -208,19 +254,22 @@ def save_feature_list(
     if output_dir is None:
         output_dir = os.path.join(os.path.dirname(__file__), '..')
 
+    os.makedirs(output_dir, exist_ok=True)
+
     sorted_names = sorted(feature_names)
+
+    # Hash only the confirmed feature list — sorted() and separators required
+    json_str = json.dumps(sorted_names, separators=(',', ':'))
+    sha256_hash = hashlib.sha256(json_str.encode('utf-8')).hexdigest()
+
     content = {
-        'features': sorted_names,
+        'confirmed_features': sorted_names,
         'count': len(sorted_names),
+        'feature_list_hash': sha256_hash,
+        'feature_list_hash_algorithm': 'sha256_sorted_json_no_whitespace',
     }
     if metadata:
         content['metadata'] = metadata
-
-    # Compute hash of sorted feature list (just the names, not metadata)
-    json_str = json.dumps(sorted_names, sort_keys=True)
-    sha256_hash = hashlib.sha256(json_str.encode('utf-8')).hexdigest()
-    content['feature_list_hash'] = sha256_hash
-    content['feature_list_hash_algorithm'] = 'sha256_sorted_json'
 
     filepath = os.path.join(output_dir, 'feature_list.json')
     with open(filepath, 'w') as f:
@@ -249,11 +298,11 @@ def load_feature_list(filepath: str = None) -> tuple[list[str], str]:
     with open(filepath, 'r') as f:
         content = json.load(f)
 
-    features = content['features']
+    features = content['confirmed_features']
     stored_hash = content['feature_list_hash']
 
-    # Verify hash
-    json_str = json.dumps(sorted(features), sort_keys=True)
+    # Verify hash — must match the same sorted() + separators convention
+    json_str = json.dumps(sorted(features), separators=(',', ':'))
     computed_hash = hashlib.sha256(json_str.encode('utf-8')).hexdigest()
 
     if computed_hash != stored_hash:
@@ -312,6 +361,7 @@ def check_demotion_history(
             history[feat] = 0
 
     # Save updated history
+    os.makedirs(os.path.dirname(history_file), exist_ok=True)
     with open(history_file, 'w') as f:
         json.dump(history, f, indent=2)
 
