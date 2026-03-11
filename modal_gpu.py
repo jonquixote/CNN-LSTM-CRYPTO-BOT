@@ -56,7 +56,7 @@ gpu_image = (
         "packaging>=21.0",
     )
     .add_local_dir(
-        "/root/modal_build_context",
+        os.path.dirname(os.path.abspath(__file__)),
         remote_path="/root/cnn_lstm_v1",
     )
 )
